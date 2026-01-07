@@ -239,7 +239,6 @@ def parse_data_and_scale(network, gene_list, scaler=None, fit_scaler=False):
 
     scaled_data = scaler.transform(ordered_gene_data)
 
-
     return scaled_data
 
 if __name__ == '__main__':
@@ -469,19 +468,24 @@ if __name__ == '__main__':
             if control_group_network.name.split('_')[0] == experimental_group_network.name.split('_')[0]:
                 network_name = control_group_network.name.split("_")[0]
                 logging.info(f'\tNetwork: {network_name}')
+                
+                # Find the common genes genes present in the control and experimental groups for the network
                 control_group_nodes = [node.name for node in control_group_network.nodes]
                 experimental_group_nodes = [node.name for node in experimental_group_network.nodes]
 
                 control_group_genes_set = set(control_group_nodes)
                 experimental_group_genes_set = set(experimental_group_nodes)
+                
                 common_genes_set = control_group_genes_set.intersection(experimental_group_genes_set)
                 gene_list = list(common_genes_set)
 
+                # Scale the data for the control and experimental group based on the control group
                 control_group_data = parse_data_and_scale(control_group_network, gene_list, scaler=max_abs_scaler, fit_scaler=True)
                 experimental_group_data = parse_data_and_scale(experimental_group_network, gene_list, scaler=max_abs_scaler, fit_scaler=False)
 
                 min_num_cells = min(control_group_data.shape[0], experimental_group_data.shape[0])
 
+                # Calculate the relative abundance as the mean expression of the experimental / mean expression of the control
                 mean_expression_control = np.mean(control_group_data, axis=0)
                 mean_expression_experimental = np.mean(experimental_group_data, axis=0)
 
@@ -560,7 +564,6 @@ if __name__ == '__main__':
                 logging.info(f'\t\t\t-log10(P-value): {log_p_value}')
 
                 p_values.append(p_value)
-
 
                 # Create the paths to the relative abundance results
                 text_file_path = f'{file_path}/text_files'

@@ -1,16 +1,6 @@
 #!/bin/bash -l
 
-#SBATCH --job-name scBONITA2
-#SBATCH --partition compute
-#SBATCH --nodes=1
-#SBATCH --cpus-per-task 5
-#SBATCH --mem 64G
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
-
-set -euo pipefail
 CONDA_ENV_NAME="scBonita"
-
 # -------------- User Input --------------
 
 # IMPORTANT!!! MAKE SURE THAT THERE ARE NO SPACES IN FILE NAMES
@@ -20,19 +10,19 @@ CONDA_ENV_NAME="scBonita"
 # =============================================
 # Which parts do you want to run? Set True to run or False to skip
     # Rule determination must be run prior to importance score, importance score must be run prior to relative abundance
-RUN_RULE_DETERMINATION=true
-RUN_IMPORTANCE_SCORE=true
-RUN_RELATIVE_ABUNDANCE=true
+RUN_RULE_DETERMINATION=false
+RUN_IMPORTANCE_SCORE=false
+RUN_RELATIVE_ABUNDANCE=false
 RUN_ATTRACTOR_ANALYSIS=true
 
 # General Arguments (Required for all steps)
 # HIV_dataset_normalized_integrated_counts
-DATA_FILE="input/george_HIV_data.csv"
+DATA_FILE="./input/george_HIV_data.csv"
 DATASET_NAME="george_hiv" # Enter the name of your dataset
 DATAFILE_SEP="," # Enter the character that the values in your dataset are split by
 
 # "04064" "04630" "04620" "04666" "04060" "04210" "04150" "04010" "04621"
-KEGG_PATHWAYS=("04064") # Enter KEGG pathway codes or leave blank to find all pathways with overlapping genes. Separate like: ("04670" "05171")
+KEGG_PATHWAYS=("05417") # Enter KEGG pathway codes or leave blank to find all pathways with overlapping genes. Separate like: ("04670" "05171")
 CUSTOM_PATHWAYS=() #("modified_network.graphml") #Put custom networks in the input folder
 BINARIZE_THRESHOLD=0.01 # Data points with values above this number will be set to 1, lower set to 0
 MINIMUM_OVERLAP=1 # Specifies how many genes you want to ensure overlap with the genes in the KEGG pathways. Default is 25
@@ -143,6 +133,12 @@ activate_conda_env() {
 
     conda activate "$CONDA_ENV_NAME" || { echo "Error: Failed to activate Conda environment '$CONDA_ENV_NAME'."; exit 1; }
     echo "Activated Conda environment: $CONDA_ENV_NAME"
+
+    CONDA_ENVIRONMENT_PYTHON="$(command -v python)"
+    export CONDA_ENVIRONMENT_PYTHON
+    echo "[INFO] Using python: $CONDA_ENVIRONMENT_PYTHON"
+
+
 }
 
 run_rule_determination() {
@@ -283,6 +279,8 @@ check_for_running_jobs
 check_pipeline_steps
 determine_num_cpus
 activate_conda_env
+
+set -euo pipefail
 
 if [ "$RUN_RULE_DETERMINATION" = true ]; then run_rule_determination; fi
 if [ "$RUN_IMPORTANCE_SCORE" = true ]; then run_importance_score; fi

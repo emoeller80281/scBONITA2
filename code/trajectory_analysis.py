@@ -468,39 +468,61 @@ def train_and_evaluate_rf(combined_df, distance_columns, output_dir):
     
     return rf_model, importance_df
 
-def plot_cluster_tsne(combined_df, distance_columns, output_dir, group_column='Group'):
-    """Generates a t-SNE plot for the combined distances and colors by group."""
-    print("Generating t-SNE plot for combined pathway distances...")
-    
-    # Extract features (distances) for t-SNE
-    X = combined_df[distance_columns].values
-    
-    # Initialize and fit t-SNE
-    tsne = TSNE(n_components=2, random_state=42, n_jobs=-1)
-    tsne_embedding = tsne.fit_transform(X)
-    
-    default_orange = '#ff7f0e'
-    default_blue = '#1f77b4'
-    
-    # Map groups to colors
-    group_colors = {'HIV': default_orange, 'Healthy': default_blue}  # Define colors for groups
-    colors = combined_df[group_column].map(group_colors)
-    
-    # Plot the t-SNE embedding
-    plt.figure(figsize=(10, 6))
-    plt.scatter(tsne_embedding[:, 0], tsne_embedding[:, 1], c=colors, alpha=1, s=10)
-    plt.title('t-SNE Projection of Cells Based on Combined Pathway Distances')
-    plt.xlabel('t-SNE Dimension 1')
-    plt.ylabel('t-SNE Dimension 2')
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
-    # Add custom legend
-    for group, color in group_colors.items():
-        plt.scatter([], [], color=color, label=group, s=50)
+def plot_cluster_tsne_from_features(combined_df, distance_columns, output_dir, group_column="Group", random_state=42):
+    """
+    For cluster-distance analysis: embed CELLS using per-cell feature vectors
+    (distances to cluster 1/2 for each pathway). This is NOT precomputed pairwise distances.
+    """
+    print("Generating t-SNE plot from per-cell cluster-distance features...")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    X = combined_df[distance_columns].to_numpy(dtype=float)
+    n_samples, n_features = X.shape
+
+    if n_samples < 2:
+        raise ValueError(f"Need >=2 cells to embed; got {n_samples}")
+
+    # If only 1 feature, TSNE with init='pca' can fail; use init='random'
+    init = "random" if n_features < 2 else "pca"
+
+    # t-SNE perplexity must be < n_samples
+    perplexity = min(30, max(2, (n_samples - 1) // 3))
+
+    tsne = TSNE(
+        n_components=2,
+        init=init,
+        random_state=random_state,
+        perplexity=perplexity,
+    )
+    emb = tsne.fit_transform(X)
+
+    group_colors = {"HIV": "#ff7f0e", "Healthy": "#1f77b4"}
+    colors = combined_df[group_column].map(group_colors).fillna("grey").to_list()
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(emb[:, 0], emb[:, 1], c=colors, alpha=0.8, s=12)
+
+    for g, col in group_colors.items():
+        if g in set(combined_df[group_column].astype(str)):
+            plt.scatter([], [], color=col, label=g, s=60)
+
     plt.legend(title="Group")
+    plt.title("t-SNE of Cells from Cluster-Distance Features")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
     plt.grid(False)
-    
-    # Save the plot
-    plt.savefig(f'{output_dir}/tsne_combined_distance_to_cluster_by_group.png', dpi=300)
+
+    outpath = os.path.join(output_dir, "tsne_cluster_distance_features_by_group.png")
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"Saved: {outpath}")
+
 
 def print_classification_report(report, y_test, y_pred, output_dir):
     
@@ -537,61 +559,276 @@ def print_classification_report(report, y_test, y_pred, output_dir):
         file.write(f"  Weighted Average Recall: {report['weighted avg']['recall']:.2%}\n")
         file.write(f"  Weighted Average F1-Score: {report['weighted avg']['f1-score']:.2%}")
 
+
+from sklearn.cluster import KMeans
+
+def plot_embedding_by_cell_cluster_dominant_group(
+    embedding,
+    cells,
+    groups,                # list aligned with `cells`, values "HIV"/"Healthy"/"Unknown"
+    D,                     # cell×cell distance matrix (NxN)
+    pathway_label,         # e.g. "hsa05417"
+    output_dir,
+    method_name="umap",    # "umap" or "tsne"
+    n_clusters=2,
+    random_state=42,
+):
+    """
+    Cluster cells from the distance matrix (using rows of D as features),
+    then color the embedding by dominant group per cluster.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Use each cell's distances-to-all-cells as its feature vector
+    X = D.astype(np.float64)
+
+    # KMeans on distance-vectors
+    km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init="auto")
+    cluster_ids = km.fit_predict(X)
+
+    # Determine dominant group per cluster
+    cluster_to_color = {}
+    for cid in range(n_clusters):
+        members = [groups[i] for i in range(len(groups)) if cluster_ids[i] == cid]
+        hiv = sum(g == "HIV" for g in members)
+        healthy = sum(g == "Healthy" for g in members)
+
+        if hiv > healthy:
+            cluster_to_color[cid] = "#ff7f0e"  # HIV-dominant
+        else:
+            cluster_to_color[cid] = "#1f77b4"  # Healthy-dominant
+
+    colors = [cluster_to_color[cid] for cid in cluster_ids]
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(embedding[:, 0], embedding[:, 1], c=colors, alpha=0.6, s=10)
+
+    # Legend
+    plt.scatter([], [], color="#ff7f0e", label="HIV-dominant cluster", s=60)
+    plt.scatter([], [], color="#1f77b4", label="Healthy-dominant cluster", s=60)
+    plt.legend(title=f"{pathway_label} clusters")
+
+    plt.xlabel(f"{method_name.upper()} 1")
+    plt.ylabel(f"{method_name.upper()} 2")
+    plt.title(f"{method_name.upper()} colored by dominant group in {pathway_label} clusters")
+    plt.grid(False)
+
+    outpath = os.path.join(output_dir, f"{method_name}_{pathway_label}_color_by_cluster_dominant_group.png")
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
 def run_cell_distance_analysis():
-    # Create a subdirectory to store cell-cell distance analysis results
-    cell_distance_output_dir = f'{output_dir}/cell_distance_analysis'
-    if not os.path.exists(cell_distance_output_dir):
-        os.makedirs(cell_distance_output_dir)
-    
+    # ---------------------------------------------------------
+    # Output dir
+    # ---------------------------------------------------------
+    cell_distance_output_dir = f"{output_dir}/cell_distance_analysis"
+    os.makedirs(cell_distance_output_dir, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # Load + merge inputs (pairwise distances + group info)
+    # ---------------------------------------------------------
     cell_distance_df, cell_group_df = load_cell_distance_data(cell_group_file, pathway_distance_files)
     cell_distance_df = prepare_combined_df(cell_distance_df, cell_group_df)
 
-    cell_distance_columns = [col for col in cell_distance_df.columns if 'distance_' in col]
-    features = cell_distance_df[cell_distance_columns].values
-    
-    plot_cell_distance_kmeans_elbow(cell_distance_df, pathways, cell_distance_output_dir)
-    
-    # Generate UMAP and t-SNE embeddings
-    print("Generating UMAP and t-SNE embeddings from cell-cell distances for each pathway...")
-    umap_embedding = umap.UMAP(metric='euclidean', n_jobs=-1).fit_transform(features)
-    tsne_embedding = TSNE(n_components=2, n_jobs=-1).fit_transform(features)
-    
-    # Color map for groups
-    group_color_map = {'HIV': '#ff7f0e', 'Healthy': '#1f77b4'}
-    plot_cell_distance_umap(umap_embedding, cell_distance_df, group_color_map, cell_distance_output_dir)
-    plot_cell_distance_tsne(tsne_embedding, cell_distance_df, group_color_map, cell_distance_output_dir)
+    # Distance columns (for CLI you used, this will be 1 column)
+    cell_distance_columns = [c for c in cell_distance_df.columns if c.startswith("distance_")]
+    if len(cell_distance_columns) == 0:
+        raise ValueError("No distance columns found (expected columns like 'distance_05417').")
 
-    # Plot t-SNE by each pathway cluster
-    cluster_colors = {1: '#1f77b4', 2: '#ff7f0e'}
-    for pathway in pathways:
-        pathway_col = f'hsa{pathway}'
-        
-        plot_cell_distance_umap_by_pathway(umap_embedding, cell_distance_df, pathway_col, cell_distance_output_dir)
-        plot_cell_distance_tsne_by_pathway(tsne_embedding, cell_distance_df, pathway_col, cell_distance_output_dir)
+    if len(cell_distance_columns) != len(pathways):
+        print(f"[WARN] Found {len(cell_distance_columns)} distance column(s) but pathways has {len(pathways)} item(s). "
+              f"Continuing with detected distance columns: {cell_distance_columns}")
+
+    # ---------------------------------------------------------
+    # Build cell×cell distance matrix (Fix 3)
+    # If multiple pathways exist, we aggregate distances per pair via mean.
+    # For ONE pathway this is just that single distance column.
+    # ---------------------------------------------------------
+    print("Building cell×cell distance matrix for embedding (precomputed distances)...")
+
+    # unique cell IDs are the strings in Cell1/Cell2
+    cells = pd.Index(
+        pd.concat([cell_distance_df["Cell1"].astype(str), cell_distance_df["Cell2"].astype(str)], ignore_index=True).unique()
+    ).tolist()
+    n_cells = len(cells)
+    if n_cells < 2:
+        raise ValueError(f"Need >=2 cells to embed; found {n_cells}")
+
+    idx = {c: i for i, c in enumerate(cells)}
+
+    # Aggregate distance across pathways for each (Cell1, Cell2) row.
+    # For 1 pathway, this is identical to that column.
+    pair_dist = np.nanmean(cell_distance_df[cell_distance_columns].to_numpy(dtype=float), axis=1)
+
+    D = np.full((n_cells, n_cells), np.nan, dtype=np.float64)
+    np.fill_diagonal(D, 0.0)
+
+    c1 = cell_distance_df["Cell1"].astype(str).to_numpy()
+    c2 = cell_distance_df["Cell2"].astype(str).to_numpy()
+
+    for a, b, d in zip(c1, c2, pair_dist):
+        if np.isnan(d):
+            continue
+        i, j = idx[a], idx[b]
+        D[i, j] = d
+        D[j, i] = d
+
+    # Fill missing distances (if any) with max observed distance
+    max_d = np.nanmax(D)
+    if not np.isfinite(max_d):
+        raise ValueError("All distances are NaN; check your distance files and columns.")
+
+    missing = np.isnan(D).sum()
+    if missing > 0:
+        print(f"[WARN] Distance matrix has {missing} missing entries; filling with max distance={max_d:.4g}")
+        D = np.where(np.isnan(D), max_d, D)
+
+    # ---------------------------------------------------------
+    # Make a per-cell group vector for coloring
+    # Prefer group labels derived from the mapping in prepare_combined_df
+    # ---------------------------------------------------------
+    cell_to_group = {}
+
+    # If prepare_combined_df created Cell1_group / Cell2_group, use them.
+    if "Cell1_group" in cell_distance_df.columns:
+        for a, g in zip(cell_distance_df["Cell1"].astype(str), cell_distance_df["Cell1_group"]):
+            if pd.notna(g) and a not in cell_to_group:
+                cell_to_group[a] = str(g)
+    if "Cell2_group" in cell_distance_df.columns:
+        for b, g in zip(cell_distance_df["Cell2"].astype(str), cell_distance_df["Cell2_group"]):
+            if pd.notna(g) and b not in cell_to_group:
+                cell_to_group[b] = str(g)
+
+    groups = [cell_to_group.get(c, "Unknown") for c in cells]
+
+    # ---------------------------------------------------------
+    # Embeddings: UMAP + t-SNE on PRECOMPUTED distances
+    # ---------------------------------------------------------
+    print("Generating UMAP and t-SNE embeddings from precomputed cell×cell distances...")
+
+    umap_embedding = umap.UMAP(metric="precomputed", n_jobs=-1).fit_transform(D)
+
+    # TSNE with precomputed distances must use init="random"
+    perplexity = min(30, max(2, (n_cells - 1) // 3))  # safe choice
+    tsne_embedding = TSNE(
+        n_components=2,
+        metric="precomputed",
+        init="random",
+        random_state=42,
+        perplexity=perplexity,
+    ).fit_transform(D)
+
+    group_color_map = {"HIV": "#ff7f0e", "Healthy": "#1f77b4", "Unknown": "grey"}
+
+    # Plot UMAP
+    print("Plotting UMAP embedding (per cell)...")
+    plt.figure(figsize=(10, 6))
+    plt.scatter(
+        umap_embedding[:, 0],
+        umap_embedding[:, 1],
+        c=[group_color_map.get(g, "grey") for g in groups],
+        alpha=0.7,
+        s=10,
+    )
+    for g, col in group_color_map.items():
+        if g in set(groups):
+            plt.scatter([], [], color=col, label=g, s=60)
+    plt.legend(title="Group")
+    plt.xlabel("UMAP 1")
+    plt.ylabel("UMAP 2")
+    plt.title("UMAP of Cells from Precomputed Cell–Cell Distances")
+    plt.grid(False)
+    plt.savefig(f"{cell_distance_output_dir}/umap_cells_precomputed_distance_by_group.png", dpi=300)
+    plt.close()
+
+    # Plot t-SNE
+    print("Plotting t-SNE embedding (per cell)...")
+    plt.figure(figsize=(10, 6))
+    plt.scatter(
+        tsne_embedding[:, 0],
+        tsne_embedding[:, 1],
+        c=[group_color_map.get(g, "grey") for g in groups],
+        alpha=0.7,
+        s=10,
+    )
+    for g, col in group_color_map.items():
+        if g in set(groups):
+            plt.scatter([], [], color=col, label=g, s=60)
+    plt.legend(title="Group")
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.title("t-SNE of Cells from Precomputed Cell–Cell Distances")
+    plt.grid(False)
+    plt.savefig(f"{cell_distance_output_dir}/tsne_cells_precomputed_distance_by_group.png", dpi=300)
+    plt.close()
     
-    # Random Forest classification
-    print("Training Random Forest classifier...")
+    # For each pathway (works fine for one)
+    for pathway in pathways:
+        pathway_label = f"{organism}{pathway}"  # e.g. hsa05417
+
+        plot_embedding_by_cell_cluster_dominant_group(
+            embedding=umap_embedding,
+            cells=cells,
+            groups=groups,
+            D=D,
+            pathway_label=pathway_label,
+            output_dir=f"{cell_distance_output_dir}/umap_pathways_by_cluster",
+            method_name="umap",
+            n_clusters=2,
+        )
+
+        plot_embedding_by_cell_cluster_dominant_group(
+            embedding=tsne_embedding,
+            cells=cells,
+            groups=groups,
+            D=D,
+            pathway_label=pathway_label,
+            output_dir=f"{cell_distance_output_dir}/tsne_pathways_by_cluster",
+            method_name="tsne",
+            n_clusters=2,
+        )
+
+
+    # ---------------------------------------------------------
+    # Random Forest classification (IMPORTANT NOTE)
+    # Your existing RF uses pairwise rows as samples.
+    # That is a "pair classifier", not a "cell classifier".
+    # Keeping it, but making it robust to a single pathway.
+    # ---------------------------------------------------------
+    print("Training Random Forest classifier (pairwise rows)...")
     X = cell_distance_df[cell_distance_columns]
-    y = cell_distance_df['Group'].map({'HIV': 1, 'Healthy': 0})
+    if "Group" not in cell_distance_df.columns:
+        raise ValueError("Expected a 'Group' column in cell_distance_df for RF. "
+                         "If you intended to classify cells, we should rebuild an N×P per-cell feature table instead.")
+    y = cell_distance_df["Group"].map({"HIV": 1, "Healthy": 0})
+
+    # Drop any rows with unknown labels
+    mask = y.notna()
+    X = X.loc[mask]
+    y = y.loc[mask].astype(int)
+
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-    rf_model = RandomForestClassifier(n_estimators=100, n_jobs=-1)
+
+    rf_model = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
     rf_model.fit(X_train, y_train)
 
-    # Evaluate and plot feature importances
     print("Evaluating model performance...")
     y_pred = rf_model.predict(X_test)
-    y_proba = rf_model.predict_proba(X_test)[:, 1]  # Probability for the positive class (HIV)
-    
-    cell_distance_random_forest_dir = f'{cell_distance_output_dir}/random_forest_cell_distance'
-    if not os.path.exists(cell_distance_random_forest_dir):
-        os.makedirs(cell_distance_random_forest_dir)
+    y_proba = rf_model.predict_proba(X_test)[:, 1]
+
+    cell_distance_random_forest_dir = f"{cell_distance_output_dir}/random_forest_cell_distance"
+    os.makedirs(cell_distance_random_forest_dir, exist_ok=True)
 
     plot_cell_distance_roc_curve(y_test, y_proba, cell_distance_random_forest_dir)
     plot_cell_distance_pr_curve(y_test, y_proba, cell_distance_random_forest_dir)
 
-    report = classification_report(y_test, y_pred, target_names=['Healthy', 'HIV'], output_dict=True)
-    
+    report = classification_report(y_test, y_pred, target_names=["Healthy", "HIV"], output_dict=True)
     print_classification_report(report, y_test, y_pred, cell_distance_random_forest_dir)
+
+    print("Cell distance analysis complete.")
+
 
 def run_cell_cluster_analysis():
     # Create a subdirectory to store cluster distance analysis results
@@ -670,12 +907,10 @@ def run_cell_cluster_analysis():
     combined_df.to_csv(f"{cluster_distance_output_dir}/combined_pathway_distances.csv", index=False)
     print("Combined results saved to 'combined_pathway_distances.csv'")
 
-    plot_cluster_tsne(combined_df, distance_columns, cluster_distance_output_dir, group_column='Group')
+    plot_cluster_tsne_from_features(combined_df, distance_columns, cluster_distance_output_dir, group_column="Group")
 
     # Run the function for training and evaluating the Random Forest model
     rf_model, importance_df = train_and_evaluate_rf(combined_df, distance_columns, cluster_distance_output_dir)
-
-
 
 if __name__ == "__main__":
     # Set the logging level for output
@@ -706,7 +941,6 @@ if __name__ == "__main__":
         required=False,
         metavar='organism code'
     )
-    
     
     args = parser.parse_args()
     
