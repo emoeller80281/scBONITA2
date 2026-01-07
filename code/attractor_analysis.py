@@ -32,6 +32,9 @@ import time
 from sklearn.cluster import KMeans
 from functools import lru_cache
 from scipy.spatial.distance import euclidean
+import random
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path, connected_components
 
 from cell_class import CellPopulation, Cell
 from user_input_prompts import attractor_analysis_arguments
@@ -39,6 +42,10 @@ from file_paths import file_paths
 
 # Set your Euclidean distance threshold
 EUCLIDEAN_THRESHOLD = 5  # Adjust this value based on desired precision
+
+# Configuration for random anchors
+ANCHORS_PER_CHUNK = 10  # Number of random anchor cells per chunk
+ANCHOR_SEED = 42  # Seed for reproducible anchor sampling
 
 def vectorized_run_simulation(nodes: list, cell_column: list):
     steps = 20
@@ -348,6 +355,7 @@ def compute_dtw_distance_pair(cell1: str, cell2: str, cell_trajectory_dict: dict
 def compute_dtw_distances(cell_trajectory_dict: dict):
     """
     Handles parallel processing of the dynamic time warping calculations.
+    Now respects SLURM CPU allocation.
 
     Parameters
     ----------
@@ -364,8 +372,10 @@ def compute_dtw_distances(cell_trajectory_dict: dict):
     cell_names = list(cell_trajectory_dict.keys())
     cell_pairs = list(combinations(cell_names, 2))
 
-    # Limit the number of CPUs used for multiprocessing if needed
-    num_cpus = min(8, mp.cpu_count())  # Adjust based on HPC or laptop specs
+    # Respect SLURM CPU allocation
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", mp.cpu_count()))
+    num_cpus = min(slurm_cpus, mp.cpu_count())
+    logging.info(f'\t\t  Using {num_cpus} CPUs for DTW distance computation')
 
     with mp.Pool(num_cpus) as pool:
         tasks = [(cell1, cell2, cell_trajectory_dict) for cell1, cell2 in cell_pairs]
@@ -592,7 +602,9 @@ def plot_average_trajectory(df: pd.DataFrame, title: str, path: str):
     plt.close()
 
 
-def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_directory: str):
+def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_directory: str, 
+                            anchors_per_chunk: int = ANCHORS_PER_CHUNK, 
+                            anchor_seed: int = ANCHOR_SEED):
     """
     Sorts chunks of cells into clusters based on their pairwise DTW distances.
 
@@ -603,6 +615,8 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
     clustering process is done twice, once to summarize groups of cells and again to summarize the group chunks into
     n number of clusters. This reduces the number of pairwise comparisons needed for hierarchical clustering while still
     accounting for each cell.
+    
+    Now includes random anchor sampling to connect chunks via cross-chunk DTW distances.
 
     Parameters
     ----------
@@ -612,6 +626,10 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
         The number of clusters to be processed.
     output_directory : str
         The directory to save the pairwise distance file to.
+    anchors_per_chunk : int
+        Number of random anchor cells to sample per chunk for cross-chunk distances.
+    anchor_seed : int
+        Random seed for reproducible anchor sampling.
 
     Returns
     ----------
@@ -629,7 +647,16 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
     # Chunk the data down to create smaller averaged trajectory clusters
     cluster_chunks = {}
     cells_in_chunks = {}
+    cells_per_chunk = {}  # Track flat list of cells per chunk for anchor sampling
+    anchors_by_chunk = {}
+    
+    # For loading anchor trajectories later
+    all_cell_trajectories = {}
+    
     logging.info(f'\t\tCreating chunks, this may take a while depending on how many cells and the chunk size')
+    
+    # STEP 1: Make chunk membership deterministic by sorting trajectory files
+    all_traj_files = sorted([f for f in os.listdir(cell_txt_traj_dir) if f.endswith("_trajectory.csv")])
     
     for chunk in range(num_chunks):
         start = time.time()
@@ -637,7 +664,7 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
         cell_trajectory_dict = {}
 
         num_cells_parsed = 0
-        for traj_filename in os.listdir(cell_txt_traj_dir):
+        for traj_filename in all_traj_files:
             
             # Keep track of how many files are parsed in this batch and which cells trajectories were analyzed
             if num_cells_parsed <= num_cells_per_chunk-1 and traj_filename.endswith("_trajectory.csv") and traj_filename not in trajectory_files_parsed:
@@ -651,9 +678,13 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
                 
                 # Extract the gene values from the dataset and append them to a dictionary with the gene name as key
                 cell_trajectory_dict[traj_filename] = {gene: df.loc[gene].values for gene in df.index}
+                all_cell_trajectories[traj_filename] = cell_trajectory_dict[traj_filename]
                 num_cells_parsed += 1
 
-        # Computes the pairwise DTW distances between cells
+        # STEP 2: Track which cells are in each chunk (for anchor sampling)
+        cells_per_chunk[chunk] = list(cell_trajectory_dict.keys())
+        
+        # Computes the pairwise DTW distances between cells within this chunk
         dtw_distances = compute_dtw_distances(cell_trajectory_dict)
 
         # Write out the distances or append them if its a different cluster
@@ -701,7 +732,42 @@ def create_trajectory_chunks(num_chunks: int, num_clusters: int, output_director
             print(
                 f'\t\tCreating chunk {chunk+1} / {num_chunks} (Est remaining: {round(length * (num_chunks - chunk))}s)')
 
+    # STEP 3: Sample random anchors per chunk
+    logging.info(f'\t\tSampling {anchors_per_chunk} random anchors per chunk (seed={anchor_seed})')
+    rng = random.Random(anchor_seed)
+    
+    for chunk_id, chunk_cells in cells_per_chunk.items():
+        k = min(anchors_per_chunk, len(chunk_cells))
+        anchors_by_chunk[chunk_id] = rng.sample(chunk_cells, k)
+        logging.info(f'\t\t  Chunk {chunk_id}: sampled {k} anchors from {len(chunk_cells)} cells')
 
+    # STEP 4: Compute cross-chunk anchor-to-anchor DTW distances
+    logging.info(f'\t\tComputing cross-chunk anchor distances...')
+    anchor_pairs = []
+    for i in range(num_chunks):
+        for j in range(i + 1, num_chunks):
+            for a in anchors_by_chunk[i]:
+                for b in anchors_by_chunk[j]:
+                    anchor_pairs.append((a, b))
+    
+    logging.info(f'\t\t  {len(anchor_pairs)} cross-chunk anchor pairs to compute')
+    
+    if len(anchor_pairs) > 0:
+        # Respect SLURM CPU allocation
+        slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", mp.cpu_count()))
+        num_cpus = min(slurm_cpus, mp.cpu_count())
+        
+        with mp.Pool(num_cpus) as pool:
+            # Only pass the trajectories we need (anchors only) to minimize memory
+            tasks = [(cell1, cell2, all_cell_trajectories) for cell1, cell2 in anchor_pairs]
+            results = pool.starmap(compute_dtw_distance_pair, tasks)
+            
+            # Append anchor distances to the same distances.csv file
+            with open(f'{output_directory}/distances.csv', 'a') as outfile:
+                for cell1, cell2, total_distance in results:
+                    outfile.write(f'{cell1},{cell2},{total_distance}\n')
+        
+        logging.info(f'\t\t  Cross-chunk anchor distances written to distances.csv')
 
     return cluster_chunks, cells_in_chunks, num_clusters
 
@@ -730,7 +796,11 @@ def cluster_cells(num_files: int, output_directory: str, num_cells_per_chunk: in
     group_dict = {}
 
     # Creates representative trajectories for each cluster using smaller sub-sets of cells to reduce processing
-    cluster_chunks, cells_in_chunks, num_clusters = create_trajectory_chunks(num_chunks, num_clusters, output_directory)
+    cluster_chunks, cells_in_chunks, num_clusters = create_trajectory_chunks(
+        num_chunks, num_clusters, output_directory,
+        anchors_per_chunk=ANCHORS_PER_CHUNK,
+        anchor_seed=ANCHOR_SEED
+    )
 
     # Computes the dynamic time warping distance between each representative cluster trajectory across all chunks
     logging.info(f'\t\tComparing chunks')
@@ -931,7 +1001,7 @@ if __name__ == '__main__':
     all_networks = []
     logging.info(f'\nRunning attractor analysis for all networks...')
     pickle_file_path = f'{file_paths["pickle_files"]}/{dataset_name}_pickle_files/network_pickle_files/'
-    for pickle_file in glob.glob(pickle_file_path + str(dataset_name) + "_" + "*" + ".network.pickle"):
+    for pickle_file in glob.glob(pickle_file_path + str(dataset_name) + "_" + "*05417" + ".network.pickle"):
         if pickle_file:
             logging.info(f'\tLoading data file: ...{pickle_file[-50:]}')
             network = pickle.load(open(pickle_file, "rb"))

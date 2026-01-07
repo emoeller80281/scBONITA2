@@ -11,6 +11,8 @@ from sklearn.metrics import classification_report
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score, classification_report, confusion_matrix
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path, connected_components
 
 from file_paths import file_paths
 
@@ -675,15 +677,61 @@ def run_cell_distance_analysis():
         D[i, j] = d
         D[j, i] = d
 
-    # Fill missing distances (if any) with max observed distance
-    max_d = np.nanmax(D)
-    if not np.isfinite(max_d):
-        raise ValueError("All distances are NaN; check your distance files and columns.")
-
-    missing = np.isnan(D).sum()
-    if missing > 0:
-        print(f"[WARN] Distance matrix has {missing} missing entries; filling with max distance={max_d:.4g}")
-        D = np.where(np.isnan(D), max_d, D)
+    # Fill missing distances using shortest-path completion instead of max-fill
+    print("Computing shortest-path completion for missing distances...")
+    
+    # Build sparse graph from observed distances
+    # Create COO format lists
+    row_idx = []
+    col_idx = []
+    data = []
+    
+    for a, b, d in zip(c1, c2, pair_dist):
+        if np.isnan(d):
+            continue
+        i, j = idx[a], idx[b]
+        row_idx.append(i)
+        col_idx.append(j)
+        data.append(d)
+        # Symmetric
+        row_idx.append(j)
+        col_idx.append(i)
+        data.append(d)
+    
+    # Add diagonal (distance to self = 0)
+    for i in range(n_cells):
+        row_idx.append(i)
+        col_idx.append(i)
+        data.append(0.0)
+    
+    # Create sparse matrix
+    W = csr_matrix((data, (row_idx, col_idx)), shape=(n_cells, n_cells))
+    
+    # Check connectivity
+    n_components, labels = connected_components(W, directed=False, return_labels=True)
+    print(f"Graph has {n_components} connected component(s)")
+    
+    if n_components > 1:
+        print(f"[WARN] Graph is disconnected! Consider increasing ANCHORS_PER_CHUNK.")
+        # Count cells in each component
+        for comp in range(n_components):
+            count = np.sum(labels == comp)
+            print(f"  Component {comp}: {count} cells")
+    
+    # Compute all-pairs shortest paths
+    D_sp = shortest_path(W, directed=False, unweighted=False, method='auto')
+    
+    # Check for remaining infinities (disconnected components)
+    num_inf = np.isinf(D_sp).sum()
+    if num_inf > 0:
+        print(f"[WARN] {num_inf} entries are still infinite after shortest-path (disconnected graph)")
+        # As last resort, fill infinities with a large value
+        max_finite = np.max(D_sp[np.isfinite(D_sp)])
+        large_distance = max_finite * 10  # or some other heuristic
+        D_sp = np.where(np.isinf(D_sp), large_distance, D_sp)
+        print(f"  Filled infinite distances with {large_distance:.4g}")
+    
+    D = D_sp  # Use shortest-path completed matrix for embedding
 
     # ---------------------------------------------------------
     # Make a per-cell group vector for coloring
@@ -859,12 +907,34 @@ def run_cell_cluster_analysis():
         cell_group_df = pd.read_csv(cell_group_file, sep=',', header=0, index_col=0)
 
         # Collect distances for each cell in this pathway
+        # Only process cells that are in cell_group_df (cells that were part of clustering analysis)
         results = []
+        cells_in_group_df = set(cell_group_df['Cell'].astype(str).str.strip().values)
+        
         for cell_file in os.listdir(cell_trajectory_dir):
             if cell_file.endswith(".csv"):
                 cell_path = os.path.join(cell_trajectory_dir, cell_file)
                 cell_num = int(cell_file.split('_')[1:2][0])
-                group = str(cell_group_df.loc[cell_group_df['Cell'] == cell_num, 'Group'].values[0])
+                
+                # Check if this cell is in cell_group_df using the full cell identifier
+                cell_identifier_options = [
+                    str(cell_num),                          # Just the number
+                    f"cell_{cell_num}",                     # With cell_ prefix
+                    f"cell_{cell_num}_trajectory.csv",      # Full filename
+                ]
+                
+                # Find matching cell in group_df
+                cell_match = None
+                for cell_id in cell_identifier_options:
+                    if cell_id in cells_in_group_df:
+                        cell_match = cell_group_df.loc[cell_group_df['Cell'].astype(str) == cell_id, 'Group']
+                        if len(cell_match) > 0:
+                            break
+                
+                if cell_match is None or len(cell_match) == 0:
+                    continue  # Skip cells not in group file (silently)
+                
+                group = str(cell_match.values[0])
                 
                 # Calculate distances to each cluster
                 closest_cluster, dist_cluster_1, dist_cluster_2 = calculate_closest_cluster(cell_path, cluster_1_genes, cluster_2_genes, cluster_1_values, cluster_2_values)
