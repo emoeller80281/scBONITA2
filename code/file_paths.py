@@ -13,5 +13,6 @@ file_paths = {
     'pathway_xml_files' : os.path.join(script_dir, '../scBONITA_output/pathway_xml_files'),
     'custom_graphml' : os.path.join(script_dir, '../input/custom_graphml_files'),
     'trajectories' : os.path.join(script_dir, '../scBONITA_output/trajectories'),
-    'trajectory_analysis': os.path.join(script_dir, '../scBONITA_output/trajectory_analysis')
+    'trajectory_analysis': os.path.join(script_dir, '../scBONITA_output/trajectory_analysis'),
+    'metadata' : os.path.join(script_dir, '../input')
 }

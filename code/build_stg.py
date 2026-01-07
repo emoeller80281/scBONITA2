@@ -121,6 +121,54 @@ for attractor, count in largest_attractors:
     logging.info(f"  Attractor {attractor_id}: {count} cells (state: {attractor})")
 
 # ============================================================================
+# STEP 2B: Load cell group information (HIV vs Healthy)
+# ============================================================================
+logging.info("\nSTEP 2B: Loading cell group information...")
+
+# Load cell group file to map cells to condition (HIV or Healthy)
+# Format: index cell_barcode group (space-separated, no header)
+cell_group_file = f'{file_paths["metadata"]}/george_HIV_metadata.txt'
+cell_to_group = {}
+
+if os.path.exists(cell_group_file):
+    try:
+        # Read metadata file with space separator, no header
+        # Columns: 0=index, 1=cell_barcode, 2=group
+        cell_group_df = pd.read_csv(cell_group_file, sep=' ', header=None, dtype=str)
+        
+        # Map cell_number (index) to group
+        for _, row in cell_group_df.iterrows():
+            try:
+                cell_index = int(row[0].strip('"'))  # Remove quotes from index
+                group = row[2].strip('"')  # Remove quotes from group
+                cell_to_group[cell_index] = group
+            except (ValueError, IndexError) as e:
+                logging.debug(f"Could not parse metadata row: {e}")
+                continue
+        
+        logging.info(f"Loaded group information for {len(cell_to_group)} cells")
+        logging.info(f"Groups found: {set(cell_to_group.values())}")
+    except Exception as e:
+        logging.warning(f"Could not load cell group file: {e}")
+else:
+    logging.warning(f"Cell group file not found: {cell_group_file}")
+
+# Track which cells (and their groups) pass through each state
+state_to_cells = defaultdict(set)  # Maps state -> set of cell_numbers
+state_to_groups = defaultdict(lambda: defaultdict(int))  # Maps state -> {group: count}
+
+for cell_number, states in cell_trajectories_mapped.items():
+    # Get the group for this cell
+    cell_group = cell_to_group.get(cell_number, 'Unknown')
+    
+    # Track all states in this cell's trajectory
+    for state in set(states):  # Use set to count each state only once per cell
+        state_to_cells[state].add(cell_number)
+        state_to_groups[state][cell_group] += 1
+
+logging.info(f"Mapped {len(state_to_cells)} states to cell group composition")
+
+# ============================================================================
 # STEP 3: Build the state transition graph
 # ============================================================================
 logging.info("\nSTEP 3: Building state transition graph...")
@@ -132,10 +180,29 @@ for state in states_in_compressed_trajectories:
     state_id = state_library[state]
     is_attractor = state in attractor_identification
     attractor_size = attractor_identification.get(state, 0)
+    
+    # Determine dominant group(s) for this state
+    group_counts = state_to_groups.get(state, {})
+    dominant_groups = []
+    max_count = max(group_counts.values()) if group_counts else 0
+    if max_count > 0:
+        dominant_groups = [g for g, count in group_counts.items() if count == max_count]
+    dominant_group = ','.join(sorted(dominant_groups)) if dominant_groups else 'Unknown'
+    
+    # Count cells by group for this state
+    hiv_count = group_counts.get('HIV', 0)
+    healthy_count = group_counts.get('Healthy', 0)
+    unknown_count = group_counts.get('Unknown', 0)
+    
     G.add_node(state_id, 
                state=str(state),  # Convert tuple to string
                is_attractor=is_attractor,
-               attractor_size=attractor_size)  # Don't include genes list in nodes
+               attractor_size=attractor_size,
+               dominant_group=dominant_group,
+               hiv_cells=hiv_count,
+               healthy_cells=healthy_count,
+               unknown_cells=unknown_count,
+               total_cells=hiv_count + healthy_count + unknown_count)
 
 # Add edges for state transitions
 for (state_from, state_to), cells in state_transitions.items():
@@ -302,6 +369,153 @@ nx.write_graphml(G, f'{stg_output_dir}/stg_graph.graphml')
 logging.info(f"Saved STG as GraphML (with pseudotime) to {stg_output_dir}/stg_graph.graphml")
 
 # ============================================================================
+# STEP 5B: Calculate condition bias and disease-state regions
+# ============================================================================
+logging.info("\nSTEP 5B: Calculating condition bias and disease-state clustering...")
+
+# Calculate condition bias for each state
+# condition_bias = (HIV_cells - Healthy_cells) / (HIV_cells + Healthy_cells)
+# Range: -1 (all Healthy) to +1 (all HIV)
+condition_bias = {}
+all_biases = []
+
+for node in G.nodes():
+    hiv = G.nodes[node]['hiv_cells']
+    healthy = G.nodes[node]['healthy_cells']
+    total = hiv + healthy
+    
+    if total > 0:
+        bias = (hiv - healthy) / total
+        condition_bias[node] = bias
+        all_biases.append(bias)
+    else:
+        condition_bias[node] = 0.0  # Default for states with no HIV/Healthy cells
+
+# Calculate standard deviation of condition bias
+if all_biases:
+    sigma = np.std(all_biases)
+else:
+    sigma = 0.1  # Default if no biases computed
+
+logging.info(f"Condition bias calculated for {len(condition_bias)} states")
+logging.info(f"Condition bias range: [{min(all_biases):.3f}, {max(all_biases):.3f}]")
+logging.info(f"Standard deviation (σ): {sigma:.3f}")
+
+# Classify states into disease-state regions
+# Healthy: condition_bias < -σ (predominantly Healthy cells)
+# Mixed: |condition_bias| ≤ σ (balanced HIV and Healthy)
+# HIV: condition_bias > σ (predominantly HIV cells)
+for node in G.nodes():
+    bias = condition_bias[node]
+    
+    if bias < -sigma:
+        region = 'Healthy'
+    elif bias > sigma:
+        region = 'HIV'
+    else:
+        region = 'Mixed'
+    
+    G.nodes[node]['condition_bias'] = float(bias)
+    G.nodes[node]['disease_region'] = region
+
+# Count states by region
+region_counts = Counter([G.nodes[n]['disease_region'] for n in G.nodes()])
+logging.info(f"Disease-state region distribution:")
+for region, count in sorted(region_counts.items()):
+    logging.info(f"  {region}: {count} states")
+
+# Save condition bias data
+condition_bias_df = pd.DataFrame([
+    {
+        'state_id': node,
+        'state': G.nodes[node]['state'],
+        'hiv_cells': G.nodes[node]['hiv_cells'],
+        'healthy_cells': G.nodes[node]['healthy_cells'],
+        'total_cells': G.nodes[node]['total_cells'],
+        'condition_bias': G.nodes[node]['condition_bias'],
+        'disease_region': G.nodes[node]['disease_region']
+    }
+    for node in G.nodes()
+])
+condition_bias_df.to_csv(f'{stg_output_dir}/condition_bias.csv', index=False)
+logging.info(f"Saved condition bias data to {stg_output_dir}/condition_bias.csv")
+
+# ============================================================================
+# STEP 5B: Link attractors based on similarity
+# ============================================================================
+logging.info("\nSTEP 5B: Computing attractor-to-attractor similarity...")
+
+# Define similarity thresholds (as fraction of genes that differ)
+STRONG_SIMILARITY_THRESHOLD = 0.02  # <2% different = strong link
+WEAK_SIMILARITY_THRESHOLD = 0.05    # <5% different = weak link
+# Beyond 5% = no link
+
+# Only compute similarity for top N attractors to keep graph manageable
+TOP_N_ATTRACTORS_FOR_SIMILARITY = 100
+attractor_list = [state for state, _ in attractor_counts.most_common(TOP_N_ATTRACTORS_FOR_SIMILARITY)]
+num_genes = len(attractor_list[0]) if attractor_list else 0
+
+logging.info(f"Computing similarity for top {len(attractor_list)} attractors (by cell count)")
+
+attractor_similarity_edges = []
+
+for i, attractor_a in enumerate(attractor_list):
+    for j, attractor_b in enumerate(attractor_list):
+        if i >= j:  # Only compute upper triangle (avoid duplicates and self-loops)
+            continue
+        
+        # Calculate Hamming distance (number of differing positions)
+        hamming_dist = sum(a != b for a, b in zip(attractor_a, attractor_b))
+        hamming_fraction = hamming_dist / num_genes if num_genes > 0 else 1.0
+        
+        # Determine if we should link them
+        if hamming_fraction < STRONG_SIMILARITY_THRESHOLD:
+            link_type = 'strong'
+            similarity_weight = 1.0 - hamming_fraction  # Close to 1.0
+        elif hamming_fraction < WEAK_SIMILARITY_THRESHOLD:
+            link_type = 'weak'
+            similarity_weight = 1.0 - hamming_fraction  # Between 0.95-0.98
+        else:
+            continue  # No link for dissimilar attractors
+        
+        attractor_id_a = state_library[attractor_a]
+        attractor_id_b = state_library[attractor_b]
+        
+        # Add bidirectional edges between attractors (undirected similarity)
+        G.add_edge(attractor_id_a, attractor_id_b,
+                   edge_type='attractor_similarity',
+                   similarity=float(similarity_weight),
+                   hamming_distance=int(hamming_dist),
+                   link_strength=link_type)
+        G.add_edge(attractor_id_b, attractor_id_a,
+                   edge_type='attractor_similarity',
+                   similarity=float(similarity_weight),
+                   hamming_distance=int(hamming_dist),
+                   link_strength=link_type)
+        
+        attractor_similarity_edges.append({
+            'attractor_a': attractor_id_a,
+            'attractor_b': attractor_id_b,
+            'hamming_distance': hamming_dist,
+            'similarity': similarity_weight,
+            'link_strength': link_type
+        })
+
+logging.info(f"Added {len(attractor_similarity_edges)} attractor similarity edges ({len(attractor_similarity_edges)*2} directed edges)")
+
+logging.info(f"Added {len(attractor_similarity_edges)} attractor similarity edges ({len(attractor_similarity_edges)*2} directed edges)")
+
+# Save attractor similarity matrix
+if attractor_similarity_edges:
+    similarity_df = pd.DataFrame(attractor_similarity_edges)
+    similarity_df.to_csv(f'{stg_output_dir}/attractor_similarity.csv', index=False)
+    logging.info(f"Saved attractor similarity to {stg_output_dir}/attractor_similarity.csv")
+
+# Re-save GraphML with attractor similarity edges
+nx.write_graphml(G, f'{stg_output_dir}/stg_graph_with_similarity.graphml')
+logging.info(f"Saved enhanced STG with attractor similarity to {stg_output_dir}/stg_graph_with_similarity.graphml")
+
+# ============================================================================
 # STEP 6: Visualize the state transition graph
 # ============================================================================
 logging.info("\nSTEP 6: Visualizing state transition graph...")
@@ -336,11 +550,12 @@ nx.draw_networkx_nodes(G_filtered, pos, node_size=node_sizes, node_color=node_co
                        alpha=0.7, ax=ax)
 
 # Draw edges with varying widths based on transition count
-edges = G_filtered.edges()
-if edges:
-    edge_widths = [G_filtered[u][v]['weight'] / max([G_filtered[s][t]['weight'] for s, t in edges]) * 3 
-                   for u, v in edges]
-    nx.draw_networkx_edges(G_filtered, pos, width=edge_widths, alpha=0.5, 
+# Only draw trajectory edges (those with 'weight'), not similarity edges
+trajectory_edges = [(u, v) for u, v in G_filtered.edges() if 'weight' in G_filtered[u][v]]
+if trajectory_edges:
+    max_weight = max([G_filtered[u][v]['weight'] for u, v in trajectory_edges])
+    edge_widths = [G_filtered[u][v]['weight'] / max_weight * 3 for u, v in trajectory_edges]
+    nx.draw_networkx_edges(G_filtered, pos, edgelist=trajectory_edges, width=edge_widths, alpha=0.5, 
                            edge_color='gray', ax=ax, arrowsize=15)
 
 # Draw labels for attractor nodes
@@ -368,6 +583,43 @@ ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
 plt.savefig(f'{stg_output_dir}/stg_visualization.png', dpi=300, bbox_inches='tight')
 logging.info(f"Saved STG visualization to {stg_output_dir}/stg_visualization.png")
+plt.close()
+
+# ============================================================================
+# STEP 6B: Visualize disease-state regions
+# ============================================================================
+logging.info("\nSTEP 6B: Visualizing disease-state regions...")
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Subplot 1: Condition bias distribution
+ax = axes[0]
+all_biases_list = list(condition_bias.values())
+ax.hist(all_biases_list, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
+ax.axvline(x=-sigma, color='green', linestyle='--', linewidth=2, label=f'Healthy threshold (-σ = {-sigma:.3f})')
+ax.axvline(x=sigma, color='red', linestyle='--', linewidth=2, label=f'HIV threshold (+σ = {sigma:.3f})')
+ax.axvline(x=0, color='gray', linestyle=':', linewidth=1, label='Mixed center (0)')
+ax.set_xlabel('Condition Bias')
+ax.set_ylabel('Number of States')
+ax.set_title('Distribution of Condition Bias Across All States')
+ax.legend()
+ax.grid(axis='y', alpha=0.3)
+
+# Subplot 2: States by disease region
+ax = axes[1]
+region_colors = {'Healthy': '#1f77b4', 'Mixed': '#ff7f0e', 'HIV': '#d62728'}
+regions = list(region_counts.keys())
+region_vals = [region_counts[r] for r in regions]
+region_cols = [region_colors.get(r, 'gray') for r in regions]
+ax.bar(regions, region_vals, color=region_cols, alpha=0.7, edgecolor='black')
+ax.set_ylabel('Number of States')
+ax.set_xlabel('Disease Region')
+ax.set_title('State Distribution by Disease-State Region')
+ax.grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{stg_output_dir}/disease_state_regions.png', dpi=300, bbox_inches='tight')
+logging.info(f"Saved disease-state region visualization to {stg_output_dir}/disease_state_regions.png")
 plt.close()
 
 # ============================================================================
