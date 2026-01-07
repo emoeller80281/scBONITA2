@@ -290,7 +290,7 @@ class CalculateImportanceScore():
                         # Find the sum of the differences between the knock-in and knock-out attractors
                         knockin_difference = np.sum(np.abs(knockin_attractors_aligned ^ normal_attractors_aligned))
 
-                        knockout_attractors_aligned, normal_attractors_aligned = self.align_attractors(knockout_attractors, knockout_attractors)
+                        knockout_attractors_aligned, normal_attractors_aligned = self.align_attractors(knockout_attractors, normal_attractors)
 
                         # Find the sum of the differences between the knock-in and knock-out attractors
                         knockout_difference = np.sum(np.abs(knockout_attractors_aligned ^ normal_attractors_aligned))
