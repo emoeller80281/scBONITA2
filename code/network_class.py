@@ -8,7 +8,8 @@ class Network():
         self.nodes = None
         self.cells = None
         self.network = None
-        self.dataset = None
+        self.dataset = None  # Binarized dataset
+        self.raw_dataset = None  # Raw expression data (non-binarized)
 
         # Pathway information for the networks
         self.attractors = None

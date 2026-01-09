@@ -65,8 +65,18 @@ def extract_data(data_file, sep, sample_cells, node_indices, max_samples):
         for i, row in enumerate(reader):
             if (i + 1) in node_indices:  # Adjust index for skipped header
                 gene_names.append(row[0])
+                
                 # Offset cell indices by 1 to skip the gene name column
-                selected_data = [float(row[cell_index + 1]) for cell_index in sampled_cell_indices]
+                # Treat missing/blank strings as 0.0 to avoid float conversion errors
+                selected_data = []
+                for cell_index in sampled_cell_indices:
+                    value_str = row[cell_index + 1].strip()
+                    if value_str in ("", "NA", "NaN", "nan"):
+                        value = 0.0
+                    else:
+                        value = float(value_str)
+                    selected_data.append(value)
+                
                 data[data_row_index, :] = selected_data
                 data_row_index += 1
 
@@ -75,7 +85,6 @@ def extract_data(data_file, sep, sample_cells, node_indices, max_samples):
 def figure_graph(experimental_network, dataset_name, relative_abundances):
     G = experimental_network.network       
 
-    # Extracting importance scores and applying log transformation to relative abundances
     importance_scores = []
     node_colors = []
 
@@ -83,48 +92,62 @@ def figure_graph(experimental_network, dataset_name, relative_abundances):
         node_colors.append(relative_abundances[node.name])
         importance_scores.append(node.importance_score)
 
-    # Apply log transformation to relative abundances to get log fold change
-    log_fold_changes = np.log2(np.array(node_colors))  # Adding a small value to avoid log(0)
+    log_fold_changes = np.clip(np.array(node_colors), -1.5, 1.5)
 
-    # Define minimum and maximum node sizes
-    min_node_size = 100  # Minimum node size
-    max_node_size = 1000  # Maximum node size
+    min_node_size = 100
+    max_node_size = 1500
 
-    # Scaling importance scores for node sizes within the specified range
-    min_importance_score = min(importance_scores)
-    max_importance_score = max(importance_scores)
+    min_imp = min(importance_scores)
+    max_imp = max(importance_scores)
     scaled_importance_scores = [
-        ((iscore - min_importance_score) / (max_importance_score - min_importance_score) * (max_node_size - min_node_size) + min_node_size)
-        for iscore in importance_scores
+        ((i - min_imp) / (max_imp - min_imp) * (max_node_size - min_node_size) + min_node_size)
+        for i in importance_scores
     ]
 
     cmap = plt.cm.coolwarm
-    norm = TwoSlopeNorm(vmin=-3, vcenter=0, vmax=3)
+    norm = TwoSlopeNorm(vmin=-1.5, vcenter=0, vmax=1.5)
+    colors = [cmap(norm(v)) for v in log_fold_changes]
 
-    # Clamp the values between -3 and 3 to not drown out smaller changes with huge outliers
-    log_fold_changes = np.clip(log_fold_changes, -3, 3)
+    # --- FIGURE ---
+    fig, ax = plt.subplots(figsize=(16, 12), constrained_layout=True)
 
-    colors = [cmap(norm(value)) for value in log_fold_changes]
-
-    # Drawing the graph
-    # Create custom legend
-    blue_patch = mpatches.Patch(color='blue', label=f'Decreased expression in {experimental_group}')
-    red_patch = mpatches.Patch(color='red', label=f'Increased expression in {experimental_group}')
-    
-    fig, ax = plt.subplots(figsize=(16, 12))
     pos = nx.spring_layout(G, k=1, iterations=50)
-    nx.draw(G, pos, with_labels=True, node_color=colors, cmap='coolwarm', node_size=scaled_importance_scores, font_size=10, ax=ax)
+    nx.draw(
+        G, pos,
+        with_labels=True,
+        node_color=colors,
+        node_size=scaled_importance_scores,
+        font_size=12,
+        ax=ax
+    )
 
-    # Create a ScalarMappable and initialize a colorbar
+    # --- COLORBAR ---
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax)
-    cbar.set_label('Fold Change')
+    cbar = fig.colorbar(
+        sm,
+        ax=ax,
+        fraction=0.025,   # bigger colorbar
+        pad=0.04          # more space from axes
+    )
+    cbar_label = (
+        f"Log2 Fold Change\n"
+        f"Blue: Decreased in {experimental_group}\n"
+        f"Red: Increased in {experimental_group}"
+    )
+    cbar.set_label(cbar_label, fontsize=16)
+    cbar.ax.tick_params(labelsize=12)
 
-    ax.set_title(f"Importance Score and Log2 Fold Change for network {experimental_network.name.split('_')[0]} for dataset {dataset_name}")
-    plt.legend(handles=[blue_patch, red_patch], title=f'Log2 Fold Change of {experimental_group} compared to {control_group}')
+    # --- TITLE ---
+    ax.set_title(
+        f"Importance Score and Log2 Fold Change for "
+        f"{experimental_network.name.split('_')[0]} ({dataset_name})",
+        fontsize=20,
+        pad=15
+    )
 
     return fig
+
 
 def plot_bootstrap_histogram(bootstrap_scores, pathway_modulation):
     # Plotting
@@ -222,24 +245,29 @@ def bubble_plot(network_names, p_values):
 
     return figure
 
-def parse_data_and_scale(network, gene_list, scaler=None, fit_scaler=False):
+def parse_data_and_scale(network, gene_list, scaler=None, fit_scaler=False, apply_scaling=False):
     gene_data = {}
-    dataset = network.dataset.todense()
+    # Use raw_dataset if available, otherwise fall back to binarized dataset
+    # Use .toarray() instead of .todense() to get proper numpy ndarray (not matrix)
+    dataset = network.raw_dataset.toarray() if hasattr(network, 'raw_dataset') and network.raw_dataset is not None else network.dataset.toarray()
+    
     for node in network.nodes:
         if node.name in gene_list:
-            gene_data[node.name] = [value for value in dataset[node.index]]
+            gene_data[node.name] = list(dataset[node.index])  # Properly extracts 1D row of values
 
     # Ensure gene data is ordered according to gene_list
     ordered_gene_data = [gene_data[gene] for gene in gene_list if gene in gene_data]
     ordered_gene_data = np.array(ordered_gene_data, dtype=float).T.squeeze()  # Transpose to match the original data structure
 
-    # Scale the data
-    if fit_scaler:
-        scaler.fit(ordered_gene_data)
-
-    scaled_data = scaler.transform(ordered_gene_data)
-
-    return scaled_data
+    # Scale the data only if requested
+    if apply_scaling and scaler is not None:
+        if fit_scaler:
+            scaler.fit(ordered_gene_data)
+        scaled_data = scaler.transform(ordered_gene_data)
+        return scaled_data
+    else:
+        # Return raw data without scaling
+        return ordered_gene_data
 
 if __name__ == '__main__':
     # Set a random seed for reproducibility
@@ -371,6 +399,10 @@ if __name__ == '__main__':
                                                                  neginf=-1e10)
 
                         if split_dataset.shape[0] > 0:
+                            # Store the raw (non-binarized) data for relative abundance calculations
+                            new_network.raw_dataset = split_sparse_matrix.copy()
+                            
+                            # Binarize for rule analysis
                             split_binarized_matrix = preprocessing.binarize(split_sparse_matrix, threshold=ruleset.binarize_threshold, copy=True)
                             new_network.dataset = split_binarized_matrix
                         else:
@@ -480,8 +512,23 @@ if __name__ == '__main__':
                 gene_list = list(common_genes_set)
 
                 # Scale the data for the control and experimental group based on the control group
-                control_group_data = parse_data_and_scale(control_group_network, gene_list, scaler=max_abs_scaler, fit_scaler=True)
-                experimental_group_data = parse_data_and_scale(experimental_group_network, gene_list, scaler=max_abs_scaler, fit_scaler=False)
+                # Use raw expression values (no scaling) for relative abundance calculation
+                control_group_data = parse_data_and_scale(control_group_network, gene_list, apply_scaling=False)
+                experimental_group_data = parse_data_and_scale(experimental_group_network, gene_list, apply_scaling=False)
+
+                # Normalize each condition by total pathway expression per cell
+                # This accounts for differences in overall pathway activity between conditions
+                logging.info(f'\t\tNormalizing gene expression by total pathway expression per condition')
+                
+                # Control group normalization
+                control_total = np.sum(control_group_data, axis=1, keepdims=True)
+                control_total[control_total == 0] = 1  # Avoid division by zero
+                control_group_data = control_group_data / control_total
+                
+                # Experimental group normalization
+                experimental_total = np.sum(experimental_group_data, axis=1, keepdims=True)
+                experimental_total[experimental_total == 0] = 1  # Avoid division by zero
+                experimental_group_data = experimental_group_data / experimental_total
 
                 min_num_cells = min(control_group_data.shape[0], experimental_group_data.shape[0])
 
@@ -492,7 +539,8 @@ if __name__ == '__main__':
                 stdev_expression_control = np.std(control_group_data, axis=0)
                 stdev_expression_experimental = np.std(experimental_group_data, axis=0)
 
-                relative_abundances = (np.round(mean_expression_experimental + 1e-3,3)) / (np.round(mean_expression_control+ 1e-3,3)) # pseudocount added to avoid large changes based on small numbers
+                # Calculate log2 fold change (symmetrical: 0 = no change, positive = upregulated, negative = downregulated)
+                relative_abundances = np.log2((mean_expression_experimental + 1e-3) / (mean_expression_control + 1e-3))
 
                 file_path = f'{file_paths["relative_abundance_output"]}/{dataset_name}/{experimental_group}_vs_{control_group}'
                 filename = f'{control_group_network.name.split("_")[0]}_{dataset_name}_{experimental_group}_vs_{control_group}_relative_abundance'

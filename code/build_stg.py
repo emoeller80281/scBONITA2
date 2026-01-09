@@ -14,7 +14,7 @@ from file_paths import file_paths
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-dataset_name = "george_hiv"
+dataset_name = "atherosclerosis"
 organism = "hsa"
 pathway = "05417"
 
@@ -121,30 +121,27 @@ for attractor, count in largest_attractors:
     logging.info(f"  Attractor {attractor_id}: {count} cells (state: {attractor})")
 
 # ============================================================================
-# STEP 2B: Load cell group information (HIV vs Healthy)
+# STEP 2B: Load cell group information (AS+ vs AS-)
 # ============================================================================
 logging.info("\nSTEP 2B: Loading cell group information...")
 
-# Load cell group file to map cells to condition (HIV or Healthy)
-# Format: index cell_barcode group (space-separated, no header)
-cell_group_file = f'{file_paths["metadata"]}/george_HIV_metadata.txt'
+# Load cell group file - atherosclerosis metadata with Atherosclerosis Status
+cell_group_file = f'{file_paths["metadata"]}/atherosclerosis_dataset/combined_atherosclerosis_metadata.csv'
 cell_to_group = {}
 
 if os.path.exists(cell_group_file):
     try:
-        # Read metadata file with space separator, no header
-        # Columns: 0=index, 1=cell_barcode, 2=group
-        cell_group_df = pd.read_csv(cell_group_file, sep=' ', header=None, dtype=str)
+        # Read metadata CSV file with cell index and Atherosclerosis Status
+        cell_group_df = pd.read_csv(cell_group_file, index_col=0)
         
-        # Map cell_number (index) to group
-        for _, row in cell_group_df.iterrows():
-            try:
-                cell_index = int(row[0].strip('"'))  # Remove quotes from index
-                group = row[2].strip('"')  # Remove quotes from group
-                cell_to_group[cell_index] = group
-            except (ValueError, IndexError) as e:
-                logging.debug(f"Could not parse metadata row: {e}")
-                continue
+        # Map cell names to group (AS+ or AS-)
+        for cell_name, row in cell_group_df.iterrows():
+            group = row['Atherosclerosis Status'].strip()
+            # Extract cell number from cell name (format: barcode-Participant_N)
+            # For STG, we need numeric cell numbers
+            # Use the index order as the cell number
+            cell_index = len(cell_to_group)  # Sequential numbering
+            cell_to_group[cell_index] = group
         
         logging.info(f"Loaded group information for {len(cell_to_group)} cells")
         logging.info(f"Groups found: {set(cell_to_group.values())}")
@@ -190,8 +187,8 @@ for state in states_in_compressed_trajectories:
     dominant_group = ','.join(sorted(dominant_groups)) if dominant_groups else 'Unknown'
     
     # Count cells by group for this state
-    hiv_count = group_counts.get('HIV', 0)
-    healthy_count = group_counts.get('Healthy', 0)
+    as_plus_count = group_counts.get('AS+', 0)
+    as_minus_count = group_counts.get('AS-', 0)
     unknown_count = group_counts.get('Unknown', 0)
     
     G.add_node(state_id, 
@@ -199,10 +196,10 @@ for state in states_in_compressed_trajectories:
                is_attractor=is_attractor,
                attractor_size=attractor_size,
                dominant_group=dominant_group,
-               hiv_cells=hiv_count,
-               healthy_cells=healthy_count,
+               as_plus_cells=as_plus_count,
+               as_minus_cells=as_minus_count,
                unknown_cells=unknown_count,
-               total_cells=hiv_count + healthy_count + unknown_count)
+               total_cells=as_plus_count + as_minus_count + unknown_count)
 
 # Add edges for state transitions
 for (state_from, state_to), cells in state_transitions.items():
@@ -374,22 +371,22 @@ logging.info(f"Saved STG as GraphML (with pseudotime) to {stg_output_dir}/stg_gr
 logging.info("\nSTEP 5B: Calculating condition bias and disease-state clustering...")
 
 # Calculate condition bias for each state
-# condition_bias = (HIV_cells - Healthy_cells) / (HIV_cells + Healthy_cells)
-# Range: -1 (all Healthy) to +1 (all HIV)
+# condition_bias = (AS+_cells - AS-_cells) / (AS+_cells + AS-_cells)
+# Range: -1 (all AS-) to +1 (all AS+)
 condition_bias = {}
 all_biases = []
 
 for node in G.nodes():
-    hiv = G.nodes[node]['hiv_cells']
-    healthy = G.nodes[node]['healthy_cells']
-    total = hiv + healthy
+    as_plus = G.nodes[node]['as_plus_cells']
+    as_minus = G.nodes[node]['as_minus_cells']
+    total = as_plus + as_minus
     
     if total > 0:
-        bias = (hiv - healthy) / total
+        bias = (as_plus - as_minus) / total
         condition_bias[node] = bias
         all_biases.append(bias)
     else:
-        condition_bias[node] = 0.0  # Default for states with no HIV/Healthy cells
+        condition_bias[node] = 0.0  # Default for states with no AS+/AS- cells
 
 # Calculate standard deviation of condition bias
 if all_biases:
@@ -402,16 +399,16 @@ logging.info(f"Condition bias range: [{min(all_biases):.3f}, {max(all_biases):.3
 logging.info(f"Standard deviation (σ): {sigma:.3f}")
 
 # Classify states into disease-state regions
-# Healthy: condition_bias < -σ (predominantly Healthy cells)
-# Mixed: |condition_bias| ≤ σ (balanced HIV and Healthy)
-# HIV: condition_bias > σ (predominantly HIV cells)
+# AS-: condition_bias < -σ (predominantly AS- cells)
+# Mixed: |condition_bias| ≤ σ (balanced AS+ and AS-)
+# AS+: condition_bias > σ (predominantly AS+ cells)
 for node in G.nodes():
     bias = condition_bias[node]
     
     if bias < -sigma:
-        region = 'Healthy'
+        region = 'AS-'
     elif bias > sigma:
-        region = 'HIV'
+        region = 'AS+'
     else:
         region = 'Mixed'
     
@@ -429,8 +426,8 @@ condition_bias_df = pd.DataFrame([
     {
         'state_id': node,
         'state': G.nodes[node]['state'],
-        'hiv_cells': G.nodes[node]['hiv_cells'],
-        'healthy_cells': G.nodes[node]['healthy_cells'],
+        'as_plus_cells': G.nodes[node]['as_plus_cells'],
+        'as_minus_cells': G.nodes[node]['as_minus_cells'],
         'total_cells': G.nodes[node]['total_cells'],
         'condition_bias': G.nodes[node]['condition_bias'],
         'disease_region': G.nodes[node]['disease_region']
@@ -441,9 +438,107 @@ condition_bias_df.to_csv(f'{stg_output_dir}/condition_bias.csv', index=False)
 logging.info(f"Saved condition bias data to {stg_output_dir}/condition_bias.csv")
 
 # ============================================================================
-# STEP 5B: Link attractors based on similarity
+# STEP 5C: Detailed condition bias analysis
 # ============================================================================
-logging.info("\nSTEP 5B: Computing attractor-to-attractor similarity...")
+logging.info("\nSTEP 5C: Analyzing condition bias distribution in detail...")
+
+# Count exact values
+bias_value_counts = Counter(all_biases)
+logging.info(f"Unique condition bias values: {len(bias_value_counts)}")
+logging.info(f"States with bias = -1.0 (100% AS-): {bias_value_counts.get(-1.0, 0)}")
+logging.info(f"States with bias = +1.0 (100% AS+): {bias_value_counts.get(1.0, 0)}")
+logging.info(f"States with bias = 0.0 (50/50 mix): {bias_value_counts.get(0.0, 0)}")
+logging.info(f"States with -1.0 < bias < 1.0: {len([b for b in all_biases if -1.0 < b < 1.0])}")
+
+# Create detailed histogram visualization
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# Subplot 1: Full distribution
+ax = axes[0, 0]
+ax.hist(all_biases, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+ax.axvline(x=-1, color='blue', linestyle=':', linewidth=1, alpha=0.5, label='Pure AS- (-1)')
+ax.axvline(x=1, color='red', linestyle=':', linewidth=1, alpha=0.5, label='Pure AS+ (+1)')
+ax.axvline(x=0, color='gray', linestyle='--', linewidth=2, label='Balanced (0)')
+ax.set_xlabel('Condition Bias')
+ax.set_ylabel('Number of States')
+ax.set_title('Full Condition Bias Distribution (All States)')
+ax.legend()
+ax.grid(axis='y', alpha=0.3)
+
+# Subplot 2: Zoomed to middle region (-0.5 to +0.5)
+ax = axes[0, 1]
+middle_biases = [b for b in all_biases if -0.5 <= b <= 0.5]
+if middle_biases:
+    ax.hist(middle_biases, bins=30, alpha=0.7, color='orange', edgecolor='black')
+    ax.axvline(x=0, color='gray', linestyle='--', linewidth=2, label='Balanced (0)')
+    ax.axvline(x=-sigma, color='green', linestyle='--', linewidth=1, label=f'-σ = {-sigma:.3f}')
+    ax.axvline(x=sigma, color='red', linestyle='--', linewidth=1, label=f'+σ = {sigma:.3f}')
+    ax.set_xlabel('Condition Bias')
+    ax.set_ylabel('Number of States')
+    ax.set_title(f'Zoomed: Mixed Region (-0.5 to +0.5) - {len(middle_biases)} states')
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+else:
+    ax.text(0.5, 0.5, 'No states in middle region', ha='center', va='center', transform=ax.transAxes)
+    ax.set_title('Zoomed: Mixed Region (-0.5 to +0.5)')
+
+# Subplot 3: Count by exact value (top 20 most common)
+ax = axes[1, 0]
+top_values = bias_value_counts.most_common(20)
+if top_values:
+    values = [v for v, _ in top_values]
+    counts = [c for _, c in top_values]
+    colors_plot = ['blue' if v == -1.0 else 'red' if v == 1.0 else 'orange' for v in values]
+    ax.bar(range(len(values)), counts, color=colors_plot, alpha=0.7, edgecolor='black')
+    ax.set_xticks(range(len(values)))
+    ax.set_xticklabels([f'{v:.2f}' for v in values], rotation=45, ha='right')
+    ax.set_ylabel('Number of States')
+    ax.set_xlabel('Condition Bias Value')
+    ax.set_title('Top 20 Most Common Condition Bias Values')
+    ax.grid(axis='y', alpha=0.3)
+
+# Subplot 4: Distribution summary table
+ax = axes[1, 1]
+ax.axis('off')
+summary_text = f"""
+Condition Bias Distribution Summary
+{'='*40}
+
+Total States: {len(all_biases)}
+
+Extreme Values:
+  • Pure AS- (-1.0): {bias_value_counts.get(-1.0, 0)} states ({bias_value_counts.get(-1.0, 0)/len(all_biases)*100:.1f}%)
+  • Pure AS+ (+1.0): {bias_value_counts.get(1.0, 0)} states ({bias_value_counts.get(1.0, 0)/len(all_biases)*100:.1f}%)
+  • Balanced (0.0): {bias_value_counts.get(0.0, 0)} states
+
+Intermediate Values:
+  • -1.0 < bias < 1.0: {len([b for b in all_biases if -1.0 < b < 1.0])} states
+  • -0.5 < bias < 0.5: {len([b for b in all_biases if -0.5 < b < 0.5])} states
+
+Disease Region Classification (σ = {sigma:.3f}):
+  • AS- (bias < -{sigma:.3f}): {region_counts.get('AS-', 0)} states
+  • Mixed (|bias| ≤ {sigma:.3f}): {region_counts.get('Mixed', 0)} states
+  • AS+ (bias > {sigma:.3f}): {region_counts.get('AS+', 0)} states
+
+Statistics:
+  • Mean: {np.mean(all_biases):.3f}
+  • Median: {np.median(all_biases):.3f}
+  • Std Dev: {np.std(all_biases):.3f}
+  • Min: {min(all_biases):.3f}
+  • Max: {max(all_biases):.3f}
+"""
+ax.text(0.1, 0.9, summary_text, fontsize=10, family='monospace', 
+        verticalalignment='top', transform=ax.transAxes)
+
+plt.tight_layout()
+plt.savefig(f'{stg_output_dir}/condition_bias_detailed_analysis.png', dpi=300, bbox_inches='tight')
+logging.info(f"Saved detailed condition bias analysis to {stg_output_dir}/condition_bias_detailed_analysis.png")
+plt.close()
+
+# ============================================================================
+# STEP 5D: Link attractors based on similarity
+# ============================================================================
+logging.info("\nSTEP 5D: Computing attractor-to-attractor similarity...")
 
 # Define similarity thresholds (as fraction of genes that differ)
 STRONG_SIMILARITY_THRESHOLD = 0.02  # <2% different = strong link
@@ -500,8 +595,6 @@ for i, attractor_a in enumerate(attractor_list):
             'similarity': similarity_weight,
             'link_strength': link_type
         })
-
-logging.info(f"Added {len(attractor_similarity_edges)} attractor similarity edges ({len(attractor_similarity_edges)*2} directed edges)")
 
 logging.info(f"Added {len(attractor_similarity_edges)} attractor similarity edges ({len(attractor_similarity_edges)*2} directed edges)")
 
@@ -596,8 +689,8 @@ fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 ax = axes[0]
 all_biases_list = list(condition_bias.values())
 ax.hist(all_biases_list, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
-ax.axvline(x=-sigma, color='green', linestyle='--', linewidth=2, label=f'Healthy threshold (-σ = {-sigma:.3f})')
-ax.axvline(x=sigma, color='red', linestyle='--', linewidth=2, label=f'HIV threshold (+σ = {sigma:.3f})')
+ax.axvline(x=-sigma, color='green', linestyle='--', linewidth=2, label=f'AS- threshold (-σ = {-sigma:.3f})')
+ax.axvline(x=sigma, color='red', linestyle='--', linewidth=2, label=f'AS+ threshold (+σ = {sigma:.3f})')
 ax.axvline(x=0, color='gray', linestyle=':', linewidth=1, label='Mixed center (0)')
 ax.set_xlabel('Condition Bias')
 ax.set_ylabel('Number of States')
@@ -607,7 +700,7 @@ ax.grid(axis='y', alpha=0.3)
 
 # Subplot 2: States by disease region
 ax = axes[1]
-region_colors = {'Healthy': '#1f77b4', 'Mixed': '#ff7f0e', 'HIV': '#d62728'}
+region_colors = {'AS-': '#1f77b4', 'Mixed': '#ff7f0e', 'AS+': '#d62728'}
 regions = list(region_counts.keys())
 region_vals = [region_counts[r] for r in regions]
 region_cols = [region_colors.get(r, 'gray') for r in regions]
@@ -821,6 +914,8 @@ logging.info(f"Saved interactive 3D visualization to {html_path}")
 
 # Note: Static PNG export is disabled due to Kaleido issues with large 3D plots
 # The interactive HTML is the primary visualization
+
+
 
 # Save trajectory statistics
 trajectory_stats = []

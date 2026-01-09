@@ -39,20 +39,38 @@ def metadata_parser(metadata_file, metadata_sep, dataset_file, dataset_sep, cell
         
         combinations = []
         # Read the metadata file to assign the cells to their groups
+        line_number = 1 if header == 'y' else 0
         for line in metadata_file:
+            line_number += 1
             line = line.replace('"', '')
             line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                logging.debug(f'\t\tSkipping empty line {line_number}')
+                continue
+            
+            split_line = line.split(metadata_sep)
+            
             try:
-                cell_name = line.split(metadata_sep)[cell_name_index]
+                cell_name = split_line[cell_name_index].strip()
 
             except IndexError:
-                logging.error('\n\t!!!WARNING: Error with splitting the metadata file based on specified separator, check and re-try\n')
-                exit(1)
+                logging.error(f'\n\t!!!ERROR on line {line_number}: Cannot access cell_name_index={cell_name_index}')
+                logging.error(f'\t   Line has {len(split_line)} columns but trying to access column {cell_name_index}')
+                logging.error(f'\t   Line content (first 200 chars): {line[:200]}')
+                logging.error('\t   Check separator and cell_name_index settings\n')
+                continue
 
             try:
-                group_combination = tuple(line.split(metadata_sep)[group_index] for group_index in group_indices)
+                group_combination = tuple(split_line[group_index].strip() for group_index in group_indices)
             except IndexError:
-                raise RuntimeError("There is likely an error with the format of the metadata file, such as an extra newline character on a line or some of the cells may be named differently")
+                logging.error(f'\n\t!!!ERROR on line {line_number}: Cannot access group_indices={group_indices}')
+                logging.error(f'\t   Line has {len(split_line)} columns but trying to access columns {group_indices}')
+                logging.error(f'\t   Cell name: {cell_name if "cell_name" in locals() else "N/A"}')
+                logging.error(f'\t   Line content (first 200 chars): {line[:200]}')
+                logging.error('\t   Skipping this line...\n')
+                continue
 
             if cell_name not in groups:
                 groups[cell_name] = []
@@ -60,6 +78,11 @@ def metadata_parser(metadata_file, metadata_sep, dataset_file, dataset_sep, cell
 
             if group_combination not in combinations:
                 combinations.append(group_combination)
+        
+        if len(groups) == 0:
+            logging.error('\n\t!!!ERROR: No valid cells were found in metadata file!')
+            logging.error('\t   Check cell_name_index, group_indices, separator, and file format\n')
+            exit(1)
 
         for group_num, group in enumerate(combinations):
             logging.info(f'\tGroup {group_num + 1}: {", ".join(group)}')
@@ -70,11 +93,12 @@ def metadata_parser(metadata_file, metadata_sep, dataset_file, dataset_sep, cell
         with open(dataset_file) as datafile:        
             line_count = 1
             for line in datafile:
-                line = line.replace('"', '').strip().split(dataset_sep)
+                line = [cell.strip() for cell in line.replace('"', '').strip().split(dataset_sep)]
                 line = line[1:] # Skip the first column, not a cell
                 
                 # Append the column indices for each group to a dictionary
                 if line_count == 1:
+                    cells_not_in_metadata = 0
                     for cell_index, cell in enumerate(line):
                         try:
                             if len(groups[cell]) > 1:
@@ -87,8 +111,13 @@ def metadata_parser(metadata_file, metadata_sep, dataset_file, dataset_sep, cell
                                 cell_groups[group_name].append(cell_index)
 
                         except KeyError as e:
-                            print(f'KeyError appending {e} to cell_groups in metadata_parser, check metadata file')
+                            cells_not_in_metadata += 1
+                            if cells_not_in_metadata <= 5:  # Only show first 5 examples
+                                logging.debug(f'\t\tCell {e} in data file not found in metadata, skipping')
                             continue
+                    
+                    if cells_not_in_metadata > 0:
+                        logging.info(f'\t{cells_not_in_metadata} cells from data file not found in metadata (skipped)')
                 
                 line_count += 1
 

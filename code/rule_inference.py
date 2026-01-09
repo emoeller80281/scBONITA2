@@ -143,9 +143,18 @@ class RuleInference:
             for i, row in enumerate(reader):
                 if i in node_indices:  # Only keeps the nodes involved, skips the cell name row
                     gene_names.append(row[0])
-                    
+
                     # Offset cell indices by 1 to skip the gene name column
-                    selected_data = [float(row[cell_index+1]) for cell_index in sampled_cell_indices]
+                    # Treat missing/blank strings as 0.0 to avoid float conversion errors
+                    selected_data = []
+                    for cell_index in sampled_cell_indices:
+                        value_str = row[cell_index + 1].strip()
+                        if value_str in ("", "NA", "NaN", "nan"):
+                            value = 0.0
+                        else:
+                            value = float(value_str)
+                        selected_data.append(value)
+
                     data[data_row_index, :] = selected_data
                     data_row_index += 1
 

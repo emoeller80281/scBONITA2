@@ -3,6 +3,8 @@ scBONITA_output/*
 *.pyc
 *.csv
 *.txt
+*.h5
+*.tar
 __pycache__/
 input/custom_graphml_files/
 LOGS
